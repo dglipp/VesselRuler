@@ -1,4 +1,4 @@
-import multiprocessing as mp
+from multiprocessing import Process, RawArray, Value
 import nibabel as nib
 import numpy as np
 import os
@@ -13,28 +13,17 @@ from pathlib import Path
 # /Users/giosue/opt/miniconda3/bin/python source/ruler.py data/vessels.nii.gz
 
 # python -m nuitka --standalone  --plugin-enable=numpy --plugin-enable=pylint-warnings --plugin-enable=pkg-resources ruler.py
-class Ruler:
-    def __init__(self, path, n_threads = None):
-        if n_threads is None:
-            if(os.cpu_count() > 4):
-                self.threads = os.cpu_count() - 1
-            else:
-                self.threads = os.cpu_count()
-            self.input_mask = nib.load(path)
-        else:
-            self.threads = n_threads
-        print(f'Using {self.threads} CPU cores\n')
-        self.input_path = Path(path)
-    
-    def plane(self, grid_shape, point, norm):
+
+def _plane(grid_shape, point, norm):
         point = np.array(point)
         norm = np.array(norm)
         d = -point.dot(norm)
+
         plane_labelmap = np.zeros(grid_shape)
 
         if norm[1:].tolist() == [0, 0]:
             plane_labelmap[point[0], :, :] = 1
-            return plane_labelmap, None
+            return plane_labelmap
 
         if norm[2] == 0:
             xx = list(range(0, grid_shape[0]))
@@ -42,7 +31,7 @@ class Ruler:
             for i in range(len(xx)):
                 if yy[i] in range(grid_shape[1]):
                     plane_labelmap[xx[i], yy[i], :] = 1
-            return plane_labelmap, None
+            return plane_labelmap
 
         xx, yy = np.meshgrid(range(grid_shape[0]), range(grid_shape[1]), indexing='ij')
 
@@ -57,101 +46,120 @@ class Ruler:
                 plane_labelmap[r[0], r[1], r[2]] = 1
         plane_labelmap = np.round(plane_labelmap).astype(int)
     
-        return plane_labelmap, (xx, yy, z)
+        return plane_labelmap
 
-    def bounding_box(self, img):
-        r = np.any(img, axis=(1, 2))
-        c = np.any(img, axis=(0, 2))
-        z = np.any(img, axis=(0, 1))
+def _bounding_box(img):
+    r = np.any(img, axis=(1, 2))
+    c = np.any(img, axis=(0, 2))
+    z = np.any(img, axis=(0, 1))
 
-        rmin, rmax = np.where(r)[0][[0, -1]]
-        cmin, cmax = np.where(c)[0][[0, -1]]
-        zmin, zmax = np.where(z)[0][[0, -1]]
+    rmin, rmax = np.where(r)[0][[0, -1]]
+    cmin, cmax = np.where(c)[0][[0, -1]]
+    zmin, zmax = np.where(z)[0][[0, -1]]
 
-        return rmin, rmax, cmin, cmax, zmin, zmax
+    return rmin, rmax, cmin, cmax, zmin, zmax
 
-    def _compute_chunk(self, label):
-        # skeletonization
-        xmin, xmax, ymin, ymax, zmin, zmax = self.bounding_box(self.labeled == label)
+def _create_chunks(lst, n_chunks):
+    chunk_length = len(lst) // n_chunks
+    new = [[lst[i] for i in range(l*chunk_length, (l+1)*chunk_length)] for l in range(n_chunks)]
+    if len(lst) % n_chunks:
+        last = [(lst[-i]) for i in range(1, len(lst) % n_chunks + 1)]
+        last.reverse()
+        new.append(last)
+    return new
+
+def _compute_chunk(input_array, output_array, label_array, pixdim, shape):
+    # skeletonization
+    labeled = np.frombuffer(input_array, dtype=np.float64).reshape(shape)
+    areas_buffer = np.frombuffer(output_array, dtype=np.float64).reshape(shape)
+    for label in label_array:
+        mask = labeled == label
+        xmin, xmax, ymin, ymax, zmin, zmax = _bounding_box(mask)
         bb = (slice(xmin, xmax+1), slice(ymin,ymax+1), slice(zmin, zmax+1))
-        mask = self.input_mask.get_fdata()[bb]
+        mask = mask[bb]
         skel = skeletonize(mask.astype(np.uint8))
         areas = np.zeros_like(skel)
 
         # smoothing + derivatives
         temp_skel = np.where(skel==1)
         if(len(temp_skel[0]) < 11):
-            return (skel, areas, label, bb)
+            return
         
         tck, u = splprep([temp_skel[0], temp_skel[1], temp_skel[2]], s=len(temp_skel[0])-np.sqrt(2*len(temp_skel[0])))
         derivatives = splev(u, tck, der=1)
-
         # compute intersection
-        PIXDIM = self.input_mask.header.get_zooms()[:3]
 
         l = []
         for i in range(len(temp_skel[0])):
-            cube = skel[temp_skel[0][i]-1:temp_skel[0][i]+2, temp_skel[1][i]-1:temp_skel[1][i]+2, temp_skel[2][i]-1:temp_skel[2][i]+2]
+            cube = skel[max(0,temp_skel[0][i]-1):temp_skel[0][i]+2, max(0, temp_skel[1][i]-1):temp_skel[1][i]+2, max(0, temp_skel[2][i]-1):temp_skel[2][i]+2]
             l.append(np.sum(cube))
 
         idxs = [i for i, d in enumerate(l) if d == 3]
         for idx in idxs:
             normal = np.array([derivatives[i][idx] for i in range(3)])
             normal = normal / np.linalg.norm(normal)
+
             o = np.array([temp_skel[0][idx], temp_skel[1][idx], temp_skel[2][idx]])
-            p, _ = self.plane(mask.shape, o, normal)
+            p = _plane(mask.shape, o, normal)
             intersection = p * mask
+
             labeled, _ = MultiLabel(intersection, structure=np.ones(shape=(3,3,3)))
+
             lab = labeled[o[0], o[1], o[2]]
             if lab != 0:
-                s = PIXDIM[0] * np.sqrt(1 + ((PIXDIM[2]/PIXDIM[0])**2 - 1)*normal[2])
-                areas[temp_skel[0][idx], temp_skel[1][idx], temp_skel[2][idx]] = (np.sum(intersection)*PIXDIM[0]*PIXDIM[1]*PIXDIM[2] / s)
+                s = pixdim[0] * np.sqrt(1 + ((pixdim[2]/pixdim[0])**2 - 1)*normal[2])
+                areas[temp_skel[0][idx], temp_skel[1][idx], temp_skel[2][idx]] = (np.sum(intersection)*pixdim[0]*pixdim[1]*pixdim[2] / s)
+        areas_buffer[bb] = areas
 
-        return (skel, areas, label, bb)
+def main(path, min_voxels = 100):
+    if(os.cpu_count() > 4):
+        threads = os.cpu_count() - 1
+    else:
+        threads = os.cpu_count()
+    print(f'Using {threads} CPU cores\n')
 
-    def compute(self, min_voxels = 100):
-        print('Importing mask...')
-        vessels = self.input_mask.get_fdata()
+    
+    print('Importing mask...')
+    path = Path(path)
+    input_mask = nib.load(path)
 
-        print('Dividing mask in connected components...')
-        self.labeled, _ = MultiLabel(vessels, structure=np.ones(shape=(3,3,3)))
+    vessels = input_mask.get_fdata()
 
-        unique, counts = np.unique(self.labeled, return_counts=True)
-        labels = unique[counts > min_voxels][1:]
+    print('Dividing mask in connected components...')
+    multilabeled = MultiLabel(vessels, structure=np.ones(shape=(3,3,3)))[0].astype(int)
 
-        multilab = np.zeros_like(vessels)
-        multiskel = np.zeros_like(vessels)
-        areas = np.zeros_like(vessels)
+    os.makedirs(f'tmp/{path.stem[:-4]}', exist_ok=True)
+    ve = nib.Nifti1Image(multilabeled.astype(np.float64), input_mask.affine)
+    nib.save(ve, f'tmp/{path.stem[:-4]}/multilabel_vessels.nii.gz')
 
-        print('Creating processes pool...')
-        pool = mp.Pool(processes=self.threads)
-        chunks = [l for l in labels]
+    print('Removing too small vessels...')
+    unique, counts = np.unique(multilabeled, return_counts=True)
+    labels = unique[counts > min_voxels][1:]
+    for l in np.setdiff1d(unique, labels):
+        multilabeled[multilabeled == l] = 0
+    
+    print('Allocating shared memory...')
+    length = multilabeled.reshape(-1,1).shape[0]
+    shared_mask = RawArray('d', multilabeled.reshape(-1,1))
+    shared_skel = RawArray('d', length)
+    chunks = _create_chunks(labels, max(1, int(len(labels) / (2*threads))))
 
-        print('Starting computation...\n\n')
-        skeleton_iterable = pool.imap_unordered(self._compute_chunk, chunks, chunksize=max(1, int(len(labels) / (4*self.threads))))
+    print(f'Creating processes pool with {len(chunks)} batches...')
+    pool = [Process(target=_compute_chunk, args=(shared_mask, shared_skel, c, input_mask.header.get_zooms()[:3], multilabeled.shape)) for c in chunks]
 
-        n = 1
+    print(f'Starting computation with batch length {max(1, int(len(labels) / (2*threads)))}...\n\n')
+    for p in pool:
+        p.start()
 
-        for i, res_tuple in enumerate(skeleton_iterable):
-            skeleton, area, l, bb = res_tuple
-            print('', end='\r')
-            print(f'Completion:  {int(i/len(labels)*100)}%', end='\r')
-            if(np.sum(skeleton) > 10):
-                multilab = multilab + (self.labeled==l) * n
-                multiskel[bb] = skeleton * n
-                areas[bb] = area
-                n += 1
-        
-        ve = nib.Nifti1Image(multilab.astype(np.float64), self.input_mask.affine)
-        sk = nib.Nifti1Image(multiskel.astype(np.float64), self.input_mask.affine)
-        ar = nib.Nifti1Image(areas.astype(np.float64), self.input_mask.affine)
-        os.makedirs(f'tmp/{self.input_path.stem[:-4]}', exist_ok=True)
-        nib.save(ve, f'tmp/{self.input_path.stem[:-4]}/multilabel_vessels.nii.gz')
-        nib.save(sk, f'tmp/{self.input_path.stem[:-4]}/multilabel_skeleton.nii.gz')
-        nib.save(ar, f'tmp/{self.input_path.stem[:-4]}/areas.nii.gz')
+    for p in pool:
+        p.join()
+
+    ar = nib.Nifti1Image(np.frombuffer(shared_skel, dtype=np.float64).reshape(vessels.shape), input_mask.affine)
+    nib.save(ar, f'tmp/{path.stem[:-4]}/areas.nii.gz')
+    #sk = nib.Nifti1Image(multiskel.astype(np.float64), self.input_mask.affine)
+    #nib.save(sk, f'tmp/{self.input_path.stem[:-4]}/multilabel_skeleton.nii.gz')
 
 if __name__ == '__main__':
-    ruler = Ruler(sys.argv[1])
     tot = time.time()
-    ruler.compute()
+    main(sys.argv[1])
     print('total: ', time.time() - tot)
