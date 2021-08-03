@@ -10,7 +10,7 @@ from scipy.ndimage.measurements import label as MultiLabel
 from scipy.interpolate import splprep, splev
 from pathlib import Path
 
-# /Users/giosue/opt/miniconda3/bin/python source/ruler_queue.py data/vessels.nii.gz
+# /Users/giosue/opt/miniconda3/bin/python source/ruler_queue.py data/101079_20200322/vessels.nii.gz
 
 # python -m nuitka --standalone  --plugin-enable=numpy --plugin-enable=pylint-warnings --plugin-enable=pkg-resources ruler.py
 
@@ -55,15 +55,6 @@ def _bounding_box(img):
 
     return rmin, rmax, cmin, cmax, zmin, zmax
 
-def _create_chunks(lst, n_chunks):
-    chunk_length = len(lst) // n_chunks
-    new = [[lst[i] for i in range(l*chunk_length, (l+1)*chunk_length)] for l in range(n_chunks)]
-    if len(lst) % n_chunks:
-        last = [(lst[-i]) for i in range(1, len(lst) % n_chunks + 1)]
-        last.reverse()
-        new.append(last)
-    return new
-
 def _compute_chunk(input_queue, output_queue, pixdim, cntinue):
     # skeletonization
     while cntinue.value:
@@ -77,14 +68,12 @@ def _compute_chunk(input_queue, output_queue, pixdim, cntinue):
 
             # smoothing + derivatives
             temp_skel = np.where(skel==1)
-            if(len(temp_skel[0]) < 11):
+            if(len(temp_skel[0]) <= 3):
                 output_queue.put((id, None))
                 continue
-            
             tck, u = splprep([temp_skel[0], temp_skel[1], temp_skel[2]], s=len(temp_skel[0])-np.sqrt(2*len(temp_skel[0])))
             derivatives = splev(u, tck, der=1)
             # compute intersection
-
             l = []
             for i in range(len(temp_skel[0])):
                 cube = skel[max(0,temp_skel[0][i]-1):temp_skel[0][i]+2, max(0, temp_skel[1][i]-1):temp_skel[1][i]+2, max(0, temp_skel[2][i]-1):temp_skel[2][i]+2]
@@ -92,6 +81,7 @@ def _compute_chunk(input_queue, output_queue, pixdim, cntinue):
 
             idxs = [i for i, d in enumerate(l) if d == 3]
             for idx in idxs:
+
                 normal = np.array([derivatives[i][idx] for i in range(3)])
                 normal = normal / np.linalg.norm(normal)
 
@@ -103,12 +93,14 @@ def _compute_chunk(input_queue, output_queue, pixdim, cntinue):
 
                 lab = labeled[o[0], o[1], o[2]]
                 if lab != 0:
-                    s = pixdim[0] * np.sqrt(1 + ((pixdim[2]/pixdim[0])**2 - 1)*normal[2])
+                    s = pixdim[0] * np.sqrt(1 + ((pixdim[2]/pixdim[0])**2 - 1)*np.abs(normal[2]))
                     areas[temp_skel[0][idx], temp_skel[1][idx], temp_skel[2][idx]] = (np.sum(intersection)*pixdim[0]*pixdim[1]*pixdim[2] / s)
             output_queue.put((id, areas))
-        output_queue.put((id, None))
+        else:
+            output_queue.put((id, None))
         
-def main(path, min_voxels = 100):
+def compute_vess_areas(path, min_voxels = 100):
+    MAX_COUNTS = 30000
     ts = time.time()
     if(os.cpu_count() > 4):
         threads = os.cpu_count() - 1
@@ -126,11 +118,41 @@ def main(path, min_voxels = 100):
     print('Dividing mask in connected components...')
     multilabeled = MultiLabel(vessels, structure=np.ones(shape=(3,3,3)))[0].astype(int)
 
-    print(f'Removing vessels with n_voxels < {min_voxels}...')
     unique, counts = np.unique(multilabeled, return_counts=True)
     sort_idx = np.argsort(counts[1:])
     unique = unique[1:][sort_idx]
     counts = counts[1:][sort_idx]
+
+    print('Chunking large regions...')
+    while np.max(counts) > MAX_COUNTS:
+        largest = unique[counts > MAX_COUNTS]
+        for i, lab in enumerate(largest):
+            xmin, xmax, ymin, ymax, zmin, zmax = _bounding_box(multilabeled == lab)
+            bb = (slice(xmin, xmax+1), slice(ymin,ymax+1), slice(zmin, zmax+1))
+            slicer = (multilabeled[bb] == lab).astype(int)
+            dx, dy, dz = slicer.shape
+
+            slicer[:int(dx/2), :int(dy/2), :int(dz/2)] *= max(unique) + 1 + i*8
+            slicer[:int(dx/2), :int(dy/2), int(dz/2):] *= max(unique) + 2 + i*8
+            slicer[:int(dx/2), int(dy/2):, :int(dz/2)] *= max(unique) + 3 + i*8
+            slicer[:int(dx/2), int(dy/2):, int(dz/2):] *= max(unique) + 4 + i*8
+            slicer[int(dx/2):, :int(dy/2), :int(dz/2)] *= max(unique) + 5 + i*8
+            slicer[int(dx/2):, :int(dy/2), int(dz/2):] *= max(unique) + 6 + i*8
+            slicer[int(dx/2):, int(dy/2):, :int(dz/2)] *= max(unique) + 7 + i*8
+            slicer[int(dx/2):, int(dy/2):, int(dz/2):] *= max(unique) + 8 + i*8
+
+            multilabeled[multilabeled == lab] = 0
+            multilabeled[bb] += slicer
+
+        unique, counts = np.unique(multilabeled, return_counts=True)
+        unique = unique[1:]
+        counts = counts[1:]
+
+    sort_idx = np.argsort(counts)
+    unique = unique[sort_idx]
+    counts = counts[sort_idx]
+    print(f'Removing vessels with n_voxels < {min_voxels}...')
+
     labels = list(unique[counts > min_voxels])
     multilabeled *= np.isin(multilabeled, labels)
 
@@ -160,29 +182,26 @@ def main(path, min_voxels = 100):
             xmin, xmax, ymin, ymax, zmin, zmax = _bounding_box(mask)
             bb = (slice(xmin, xmax+1), slice(ymin,ymax+1), slice(zmin, zmax+1))
             chunk_dict[l] = bb
-            input_queue.put((l, mask[bb]))
             doing_ids.append(l)
-            print('', end='\r')
-            print(f'Progress: {int(n_done/tot*100)}%', doing_ids, end='\r')
+            input_queue.put((l, mask[bb]))
             cnt += 1
+
         try:
             id, output = output_queue.get(block=True, timeout=3)
             if id != -1:
-                try:
-                    doing_ids.remove(id)
-                except:
-                    print(id)
-            if output is None:
-                multilabeled[multilabeled == id] = 0
-            else:
-                areas[chunk_dict[id]] = output
+                doing_ids.remove(id)
+                if output is None:
+                    multilabeled[multilabeled == id] = 0
+                else:
+                    areas[chunk_dict[id]] = output
 
-            n_done += 1
-            cnt -= 1
+                n_done += 1
+                cnt -= 1
+            print('                                             ', end='\r')
+            print(f'Progress: {int(n_done/tot*100)}%', doing_ids, end='\r')
         except:
             pass
-
-    
+        
     while cnt != 0:
         id, output = output_queue.get()
         if id != -1:
@@ -191,28 +210,25 @@ def main(path, min_voxels = 100):
             multilabeled[multilabeled == id] = 0
         else:
             areas[chunk_dict[id]] = output
-        print('', end='\r')
-        print(f'Progress: {int(n_done/tot*100)}%', doing_ids, end='\r')
         n_done += 1
+        print('                                             ', end='\r')
+        print(f'Progress: {int(n_done/tot*100)}%', doing_ids, end='\r')
         cnt -= 1
-
     is_end.value = 0
-    for p in pool:
-        p.join()
 
-    os.makedirs(f'tmp/{path.stem[:-4]}', exist_ok=True)
+    os.makedirs(f'tmp/{path.parent}', exist_ok=True)
 
     print('\n\nSaving results in tmp folder...')
     ar = nib.Nifti1Image(areas.astype(np.float64), input_mask.affine)
-    nib.save(ar, f'tmp/{path.stem[:-4]}/areas.nii.gz')
+    nib.save(ar, f'tmp/{path.parent}/areas.nii.gz')
 
     sk = nib.Nifti1Image((areas.astype(bool) * multilabeled).astype(np.float64), input_mask.affine)
-    nib.save(sk, f'tmp/{path.stem[:-4]}/multilabel_skeleton.nii.gz')
+    nib.save(sk, f'tmp/{path.parent}/multilabel_skeleton.nii.gz')
 
     ve = nib.Nifti1Image(multilabeled.astype(np.float64), input_mask.affine)
-    nib.save(ve, f'tmp/{path.stem[:-4]}/multilabel_vessels.nii.gz')
+    nib.save(ve, f'tmp/{path.parent}/multilabel_vessels.nii.gz')
 
-    print(f'Task completed in {round((time.time()-ts)/60)}...')
+    print(f'Task completed in {round((time.time()-ts)/60, 2)} minutes...')
 
 if __name__ == '__main__':
-    main(sys.argv[1])
+    compute_vess_areas(sys.argv[1], int(sys.argv[2]))

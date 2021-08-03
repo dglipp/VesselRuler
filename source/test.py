@@ -1,47 +1,30 @@
+import nibabel as nib
+import matplotlib.pyplot as plt
 import numpy as np
-import time
+import seaborn as sns
 
-zipped = [(1, 1, 1), (2, 2, 2), (33, 44, 66)]
-unzipped_object = zip(*zipped)
-unzipped_list = list(unzipped_object)
+vss = nib.load('tmp/data/175252_20200314/areas.nii.gz')
+affine = vss.affine
+vess = vss.get_fdata()
 
-grid_shape = (512, 512, 512)
-labelmap1 = np.zeros(grid_shape)
-norm = [1,2,3]
-d = 4
-xx, yy = np.meshgrid(range(grid_shape[0]), range(grid_shape[1]), indexing='ij')
+def col(v):
+    if v <= 5:
+        return 'red'
+    if v <= 10:
+        return 'green'
+    if v > 10:
+        return 'yellow'
 
-z = -((-norm[0] * xx - norm[1] * yy - d) /norm[2]).astype(int)
+pixdim = vss.header.get_zooms()[:3]
+s = pixdim[0] * np.sqrt(1 + ((pixdim[2]/pixdim[0])**2 - 1)*0.7)
+fig = plt.figure(figsize=(10, 10))
+ax = fig.add_subplot(111, projection='3d')
 
+pos = np.where(vess!=0)
+ax.scatter(pos[0], pos[1], pos[2], c=list(map(col, vess[pos])), alpha=0.6, s = 0.1)
 
+ax = fig.add_subplot(333)
+sns.histplot(np.delete(vess.flatten(), vess.flatten() <= 1.5), kde=True, bins=100, ax=ax)
+ax.set_xlim(0, 140)
 
-print('starting')
-ts = time.time()
-arr = np.array([[_x, _y, z[_x, _y]] for _x in range(grid_shape[0]) for _y in range(grid_shape[1])])
-
-for r in arr:
-    if r[2] in range(grid_shape[2]):
-        labelmap1[r[0], r[1], r[2]] = 1
-print('original', time.time()-ts)
-
-labelmap2 = np.zeros(grid_shape)
-ts = time.time()
-
-arr = ([], [], [])
-for _x in range(grid_shape[0]):
-    for _y in range(grid_shape[1]):
-        zed = z[_x, _y]
-        if zed in range(grid_shape[2]):
-            arr[0].append(_x)
-            arr[1].append(_y)
-            arr[2].append(zed)
-
-labelmap2[arr] = 1
-
-print('new', time.time()-ts)
-
-ts = time.time()
-labelmap3 = np.zeros(grid_shape)
-
-
-print('defin', time.time()- ts)
+plt.show()
