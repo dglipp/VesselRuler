@@ -10,7 +10,7 @@ from scipy.ndimage.measurements import label as MultiLabel
 from scipy.interpolate import splprep, splev
 from pathlib import Path
 
-# /Users/giosue/opt/miniconda3/bin/python source/ruler_queue.py data/101079_20200322/vessels.nii.gz
+# /Users/giosue/opt/miniconda3/bin/python source/ruler.py data/101079_20200322/vessels.nii.gz
 
 # python -m nuitka --standalone  --plugin-enable=numpy --plugin-enable=pylint-warnings --plugin-enable=pkg-resources ruler.py
 
@@ -69,7 +69,7 @@ def _compute_chunk(input_queue, output_queue, pixdim, cntinue):
             # smoothing + derivatives
             temp_skel = np.where(skel==1)
             if(len(temp_skel[0]) <= 3):
-                output_queue.put((id, None))
+                output_queue.put((id, None, None))
                 continue
             tck, u = splprep([temp_skel[0], temp_skel[1], temp_skel[2]], s=len(temp_skel[0])-np.sqrt(2*len(temp_skel[0])))
             derivatives = splev(u, tck, der=1)
@@ -95,10 +95,49 @@ def _compute_chunk(input_queue, output_queue, pixdim, cntinue):
                 if lab != 0:
                     s = pixdim[0] * np.sqrt(1 + ((pixdim[2]/pixdim[0])**2 - 1)*np.abs(normal[2]))
                     areas[temp_skel[0][idx], temp_skel[1][idx], temp_skel[2][idx]] = (np.sum(intersection)*pixdim[0]*pixdim[1]*pixdim[2] / s)
-            output_queue.put((id, areas))
+            output_queue.put((id, areas, skel))
         else:
-            output_queue.put((id, None))
-        
+            output_queue.put((id, None, None))
+
+def _majority(window):
+    window = np.array(window)
+    window[window == 1] = 0
+    unique, count = np.unique(window, return_counts=True)
+    arr = np.vstack([unique, count])
+    arr = np.delete(arr, arr[0] == 0, axis=1)
+    try:
+        r = arr[0][np.argmax(np.delete(arr, arr[0] == 0, axis=1)[1])]
+    except ValueError:
+        r = 1
+    return r
+
+def _improve_skeleton(skeleton, areas):
+    areas[(areas > 0) * (areas <= 5)] = 2
+    areas[(areas <= 10) * (areas > 5)] = 3
+    areas[areas > 10] = 4
+
+    skeleton[skeleton != 0] = 1
+    res = skeleton*(areas == 0) + areas
+
+    x, y, z = np.where(res == 1)
+    v = np.zeros_like(x)
+
+    prev = len(x)
+    removed = 1
+    while(removed > 0):
+        for i in range(len(x)):
+            bb = (slice(x[i]-1, x[i]+2), slice(y[i]-1, y[i]+2), slice(z[i]-1, z[i]+2))
+            v[i] = _majority(res[bb])
+
+        res[x, y, z] = v
+
+        x, y, z = np.where(res == 1)
+        v = np.zeros_like(x)
+        removed = prev - len(x)
+        prev = len(x)
+    res[res == 1] = 0
+    return res
+
 def compute_vess_areas(path, min_voxels = 100):
     MAX_COUNTS = 30000
     ts = time.time()
@@ -114,6 +153,7 @@ def compute_vess_areas(path, min_voxels = 100):
 
     vessels = input_mask.get_fdata()
     areas = np.zeros_like(vessels)
+    skeleton = np.zeros_like(vessels)
 
     print('Dividing mask in connected components...')
     multilabeled = MultiLabel(vessels, structure=np.ones(shape=(3,3,3)))[0].astype(int)
@@ -187,14 +227,15 @@ def compute_vess_areas(path, min_voxels = 100):
             cnt += 1
 
         try:
-            id, output = output_queue.get(block=True, timeout=3)
+            id, ar, sk = output_queue.get(block=True, timeout=3)
             if id != -1:
                 doing_ids.remove(id)
-                if output is None:
+                if ar is None:
                     multilabeled[multilabeled == id] = 0
                 else:
-                    areas[chunk_dict[id]] = output
-
+                    areas[chunk_dict[id]] = ar
+                if sk is not None:
+                    skeleton[chunk_dict[id]] = sk
                 n_done += 1
                 cnt -= 1
             print('                                             ', end='\r')
@@ -203,13 +244,15 @@ def compute_vess_areas(path, min_voxels = 100):
             pass
         
     while cnt != 0:
-        id, output = output_queue.get()
+        id, ar, sk = output_queue.get()
         if id != -1:
             doing_ids.remove(id)
-        if output is None:
+        if ar is None:
             multilabeled[multilabeled == id] = 0
         else:
-            areas[chunk_dict[id]] = output
+            areas[chunk_dict[id]] = ar
+        if sk is not None:
+            skeleton[chunk_dict[id]] = sk
         n_done += 1
         print('                                             ', end='\r')
         print(f'Progress: {int(n_done/tot*100)}%', doing_ids, end='\r')
@@ -218,15 +261,23 @@ def compute_vess_areas(path, min_voxels = 100):
 
     os.makedirs(f'tmp/{path.parent}', exist_ok=True)
 
-    print('\n\nSaving results in tmp folder...')
+    print('\n\nSaving intermediate results in tmp folder...')
     ar = nib.Nifti1Image(areas.astype(np.float64), input_mask.affine)
     nib.save(ar, f'tmp/{path.parent}/areas.nii.gz')
 
-    sk = nib.Nifti1Image((areas.astype(bool) * multilabeled).astype(np.float64), input_mask.affine)
+    sk = nib.Nifti1Image(skeleton.astype(np.float64), input_mask.affine)
     nib.save(sk, f'tmp/{path.parent}/multilabel_skeleton.nii.gz')
 
     ve = nib.Nifti1Image(multilabeled.astype(np.float64), input_mask.affine)
     nib.save(ve, f'tmp/{path.parent}/multilabel_vessels.nii.gz')
+
+    print('Vessel classification in BV5 / BV5-10 / BV10...')
+    result = _improve_skeleton(skeleton, areas)
+
+    print('Saving result in results folder...')
+    os.makedirs(f'results/{path.parent}', exist_ok=True)
+    cl = nib.Nifti1Image(result.astype(np.float64), input_mask.affine)
+    nib.save(cl, f'results/{path.parent}/BV_classes.nii.gz')
 
     print(f'Task completed in {round((time.time()-ts)/60, 2)} minutes...')
 
